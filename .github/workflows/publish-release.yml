@@ -1,0 +1,162 @@
+name: Publish Release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'PKGBUILD'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Read version from PKGBUILD
+        id: version
+        run: |
+          # Read version from PKGBUILD
+
+          set -euo pipefail
+
+          PKGVER_URL=$(sed -n 's/^pkgver_url=//p' PKGBUILD | head -1)
+          PKGVER=$(sed -n 's/^pkgver=//p' PKGBUILD | head -1)
+
+          if [[ -z "${PKGVER_URL}" ]]; then
+            echo "Could not read 'pkgver_url' from PKGBUILD." >&2
+            exit 1
+          fi
+
+          echo "pkgver_url=${PKGVER_URL}" >> "${GITHUB_OUTPUT}"
+          echo "pkgver=${PKGVER}" >> "${GITHUB_OUTPUT}"
+          echo "Current pkgver_url: ${PKGVER_URL}"
+
+      - name: Check whether the version went up
+        id: check
+        env:
+          PKGVER_URL: ${{ steps.version.outputs.pkgver_url }}
+        run: |
+          # Check whether the version went up
+
+          set -euo pipefail
+
+          git fetch --tags --force >/dev/null 2>&1
+
+          python3 - << 'PYEOF'
+          import os
+          import subprocess
+
+
+          def parse_ver(v):
+            try:
+              return tuple(int(x) for x in v.replace('-', '.').split('.'))
+            except ValueError:
+              return None
+
+
+          def set_output(key, value):
+            with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f'{key}={value}\n')
+
+
+          def run(*args):
+            result = subprocess.run(args, capture_output=True, text=True)
+            return result.stdout.strip()
+
+
+          pkgver_url = os.environ['PKGVER_URL']
+          current = parse_ver(pkgver_url)
+
+          if current is None:
+            print(f"Version '{pkgver_url}' is not numeric — skipping.")
+            set_output('publish', 'false')
+            raise SystemExit(0)
+
+          tags = [t for t in run('git', 'tag').splitlines() if t]
+          releases = [
+            r for r in run(
+              'gh', 'release', 'list', '--limit', '200', '--json', 'tagName',
+              '--jq', '.[].tagName',
+            ).splitlines() if r
+          ]
+
+          if pkgver_url in tags:
+            print(f"Tag '{pkgver_url}' already exists — skipping.")
+            set_output('publish', 'false')
+            raise SystemExit(0)
+
+          if pkgver_url in releases:
+            print(f"Release '{pkgver_url}' already exists — skipping.")
+            set_output('publish', 'false')
+            raise SystemExit(0)
+
+          known = [
+            v for v in (parse_ver(t) for t in set(tags) | set(releases))
+            if v is not None
+          ]
+
+          if known:
+            latest = max(known)
+
+            if current <= latest:
+              latest_str = '.'.join(str(x) for x in latest)
+              print(f'Not a version bump: {pkgver_url} <= {latest_str}')
+              set_output('publish', 'false')
+              raise SystemExit(0)
+
+            print(f'Version went up — publishing {pkgver_url}')
+          else:
+            print(f'No previous tag or release — publishing {pkgver_url}')
+
+          set_output('publish', 'true')
+          PYEOF
+
+      - name: Create tag and publish release
+        if: steps.check.outputs.publish == 'true'
+        env:
+          PKGVER: ${{ steps.version.outputs.pkgver }}
+          PKGVER_URL: ${{ steps.version.outputs.pkgver_url }}
+        run: |
+          # Create tag and publish release
+
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git tag -a "${PKGVER_URL}" -m "Positron ${PKGVER_URL}"
+          git push origin "${PKGVER_URL}"
+
+          cat > /tmp/release_notes.md << EOF
+          Package build of the
+          [Positron ${PKGVER_URL}](https://positron.posit.co/updating.html#daily-builds)
+          daily build for Arch Linux.
+
+          | Field | Value |
+          |---|---|
+          | \`pkgname\` | \`positron-ide-daily-bin\` |
+          | \`pkgver\` | \`${PKGVER}\` |
+          | \`pkgver_url\` | \`${PKGVER_URL}\` |
+
+          See the
+          [README](https://github.com/danielvartan/positron-ide-daily-bin#usage)
+          file for installation instructions.
+          EOF
+
+          gh release create "${PKGVER_URL}" \
+            --title "${PKGVER_URL}" \
+            --notes-file /tmp/release_notes.md \
+            --latest
